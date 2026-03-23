@@ -403,6 +403,7 @@ impl SingleRWAVault {
             panic_with_error!(e, Error::FundingTargetNotMet);
         }
         put_vault_state(e, VaultState::Active);
+        put_activation_timestamp(e, e.ledger().timestamp());
         emit_vault_state_changed(e, VaultState::Funding, VaultState::Active);
         bump_instance(e);
     }
@@ -659,13 +660,37 @@ impl SingleRWAVault {
     pub fn asset(e: &Env) -> Address { get_asset(e) }
 
     pub fn current_apy(e: &Env) -> u32 {
-        let epoch = get_current_epoch(e);
         let ta = total_assets(e);
-        if epoch == 0 || ta == 0 {
+        let activation_ts = get_activation_timestamp(e);
+        if activation_ts == 0 || ta == 0 {
+            return get_expected_apy(e);
+        }
+        let now = e.ledger().timestamp();
+        let elapsed = now.saturating_sub(activation_ts);
+        if elapsed == 0 {
             return get_expected_apy(e);
         }
         let ytd = get_total_yield_distributed(e);
-        ((ytd * 10000) / ta) as u32
+        if ytd == 0 {
+            return get_expected_apy(e);
+        }
+        const SECONDS_PER_YEAR: u64 = 31_536_000;
+        let numerator = (ytd as i128)
+            .checked_mul(SECONDS_PER_YEAR as i128)
+            .and_then(|v| v.checked_mul(10000))
+            .unwrap_or(i128::MAX);
+        let denominator = (ta as i128)
+            .checked_mul(elapsed as i128)
+            .unwrap_or(i128::MAX);
+        if denominator == 0 || denominator == i128::MAX {
+            return get_expected_apy(e);
+        }
+        let apy = numerator / denominator;
+        if apy > u32::MAX as i128 {
+            u32::MAX
+        } else {
+            apy as u32
+        }
     }
 
     pub fn expected_apy(e: &Env) -> u32 { get_expected_apy(e) }

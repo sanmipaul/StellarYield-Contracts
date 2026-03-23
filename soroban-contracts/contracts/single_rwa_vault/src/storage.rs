@@ -66,6 +66,7 @@ pub enum DataKey {
     // --- Vault state ---
     VaultState,
     Paused,
+    ActivationTimestamp,
 
     // --- Epoch / yield ---
     CurrentEpoch,
@@ -186,6 +187,18 @@ instance_get!(get_vault_state, VaultState, VaultState);
 instance_put!(put_vault_state, VaultState, VaultState);
 instance_get!(get_paused, Paused, bool);
 instance_put!(put_paused, Paused, bool);
+
+pub fn get_activation_timestamp(e: &Env) -> u64 {
+    e.storage()
+        .instance()
+        .get(&DataKey::ActivationTimestamp)
+        .unwrap_or(0)
+}
+pub fn put_activation_timestamp(e: &Env, val: u64) {
+    e.storage()
+        .instance()
+        .set(&DataKey::ActivationTimestamp, &val);
+}
 
 // Epoch / yield (global)
 instance_get!(get_current_epoch,           CurrentEpoch,           u32);
