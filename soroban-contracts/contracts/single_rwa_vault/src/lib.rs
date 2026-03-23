@@ -303,6 +303,7 @@ impl SingleRWAVault {
     pub fn claim_yield(e: &Env, caller: Address) -> i128 {
         caller.require_auth();
         require_not_paused(e);
+        require_not_blacklisted(e, &caller);
 
         let amount = Self::pending_yield(e, caller.clone());
         if amount <= 0 {
