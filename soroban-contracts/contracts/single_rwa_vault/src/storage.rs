@@ -94,6 +94,9 @@ pub enum DataKey {
     // --- User deposit tracking ---
     UserDeposited(Address),
 
+    // --- Total deposited principal ---
+    TotalDeposited,
+
     // --- Early redemption ---
     RedemptionCounter,
     RedemptionRequest(u32),
@@ -268,6 +271,10 @@ instance_put!(put_total_yield_distributed, TotalYieldDistributed, i128);
 // TotalSupply
 instance_get!(get_total_supply, TotalSupply, i128);
 instance_put!(put_total_supply, TotalSupply, i128);
+
+// TotalDeposited (principal tracking)
+instance_get!(get_total_deposited, TotalDeposited, i128);
+instance_put!(put_total_deposited, TotalDeposited, i128);
 
 // RedemptionCounter
 instance_get!(get_redemption_counter, RedemptionCounter, u32);
