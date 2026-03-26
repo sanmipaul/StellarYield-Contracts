@@ -47,4 +47,12 @@ pub enum Error {
     VaultNotEmpty = 27,
     /// Epoch range is invalid (zero start, start > end, or exceeds max batch of 50).
     InvalidEpochRange = 28,
+    /// Vault is not in Emergency state.
+    NotInEmergency = 28,
+    /// User has already claimed their emergency distribution.
+    AlreadyClaimedEmergency = 29,
+    /// Storage schema version is outdated; migrate() must be called.
+    MigrationRequired = 30,
+    /// Burn requires pending yield to be claimed first (Option A).
+    BurnRequiresYieldClaim = 31,
 }

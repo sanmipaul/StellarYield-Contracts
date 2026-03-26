@@ -18,4 +18,6 @@ pub enum Error {
     BatchTooLarge = 7,
     /// Provided WASM hash is invalid (e.g. all-zeros).
     InvalidWasmHash = 8,
+    /// Storage schema version is outdated; migrate() must be called.
+    MigrationRequired = 8,
 }

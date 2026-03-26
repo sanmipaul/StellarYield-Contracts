@@ -2,12 +2,18 @@
 
 mod errors;
 mod events;
+mod math;
+mod migrations;
 mod storage;
 mod token_interface;
 mod types;
 
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(test)]
+mod test_burn_yield_accounting;
+#[cfg(test)]
+mod test_convert_erc4626;
 #[cfg(test)]
 mod test_funding_deadline;
 #[cfg(test)]
@@ -25,6 +31,7 @@ use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env,
 
 use crate::errors::Error;
 use crate::events::*;
+use crate::migrations::CURRENT_SCHEMA_VERSION;
 use crate::storage::*;
 use crate::token_interface::*;
 
@@ -40,6 +47,12 @@ const PRECISION: i128 = 1_000_000;
 
 #[contractimpl]
 impl SingleRWAVault {
+    pub const FREEZE_DEPOSIT_MINT: u32 = 1;
+    pub const FREEZE_WITHDRAW_REDEEM: u32 = 2;
+    pub const FREEZE_YIELD: u32 = 4;
+    pub const FREEZE_ALL: u32 =
+        Self::FREEZE_DEPOSIT_MINT | Self::FREEZE_WITHDRAW_REDEEM | Self::FREEZE_YIELD;
+
     // ─────────────────────────────────────────────────────────────────
     // Constructor
     // ─────────────────────────────────────────────────────────────────
@@ -104,6 +117,7 @@ impl SingleRWAVault {
         // Initial state
         put_vault_state(e, VaultState::Funding);
         put_paused(e, false);
+        put_freeze_flags(e, 0u32);
         put_locked(e, false);
         put_current_epoch(e, 0u32);
         put_total_yield_distributed(e, 0i128);
@@ -111,6 +125,10 @@ impl SingleRWAVault {
         put_total_supply(e, 0i128);
         put_transfer_requires_kyc(e, true);
         put_total_deposited(e, 0i128);
+
+        // Versioning
+        put_contract_version(e, 1u32);
+        put_storage_schema_version(e, 1u32);
 
         e.storage()
             .instance()
@@ -144,6 +162,59 @@ impl SingleRWAVault {
         get_rwa_category(e)
     }
 
+    /// Update all RWA metadata fields. Admin-only.
+    pub fn set_rwa_details(
+        e: &Env,
+        caller: Address,
+        name: String,
+        symbol: String,
+        document_uri: String,
+        category: String,
+        expected_apy: u32,
+    ) {
+        caller.require_auth();
+        require_admin(e, &caller);
+        put_rwa_name(e, name.clone());
+        put_rwa_symbol(e, symbol.clone());
+        put_rwa_document_uri(e, document_uri.clone());
+        put_rwa_category(e, category.clone());
+        put_expected_apy(e, expected_apy);
+        emit_rwa_details_updated(e, name, symbol, document_uri, category, expected_apy);
+        bump_instance(e);
+    }
+
+    /// Update only the RWA document URI. Admin-only.
+    pub fn set_rwa_document_uri(e: &Env, caller: Address, document_uri: String) {
+        caller.require_auth();
+        require_admin(e, &caller);
+        put_rwa_document_uri(e, document_uri.clone());
+        emit_rwa_details_updated(
+            e,
+            get_rwa_name(e),
+            get_rwa_symbol(e),
+            document_uri,
+            get_rwa_category(e),
+            get_expected_apy(e),
+        );
+        bump_instance(e);
+    }
+
+    /// Update only the expected APY. Admin-only.
+    pub fn set_expected_apy(e: &Env, caller: Address, expected_apy: u32) {
+        caller.require_auth();
+        require_admin(e, &caller);
+        put_expected_apy(e, expected_apy);
+        emit_rwa_details_updated(
+            e,
+            get_rwa_name(e),
+            get_rwa_symbol(e),
+            get_rwa_document_uri(e),
+            get_rwa_category(e),
+            expected_apy,
+        );
+        bump_instance(e);
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // zkMe KYC
     // ─────────────────────────────────────────────────────────────────
@@ -169,7 +240,8 @@ impl SingleRWAVault {
 
     pub fn set_zkme_verifier(e: &Env, caller: Address, verifier: Address) {
         caller.require_auth();
-        require_admin(e, &caller);
+        // ComplianceOfficer role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::ComplianceOfficer);
         let old = get_zkme_verifier(e);
         put_zkme_verifier(e, verifier.clone());
         emit_zkme_verifier_updated(e, old, verifier);
@@ -178,7 +250,8 @@ impl SingleRWAVault {
 
     pub fn set_cooperator(e: &Env, caller: Address, new_cooperator: Address) {
         caller.require_auth();
-        require_admin(e, &caller);
+        // ComplianceOfficer role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::ComplianceOfficer);
         let old = get_cooperator(e);
         put_cooperator(e, new_cooperator.clone());
         emit_cooperator_updated(e, old, new_cooperator);
@@ -201,8 +274,9 @@ impl SingleRWAVault {
     pub fn deposit(e: &Env, caller: Address, assets: i128, receiver: Address) -> i128 {
         caller.require_auth();
         // --- Checks ---
+        require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_DEPOSIT_MINT);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &receiver);
         require_kyc_verified(e, &caller);
@@ -245,8 +319,9 @@ impl SingleRWAVault {
     pub fn mint(e: &Env, caller: Address, shares: i128, receiver: Address) -> i128 {
         caller.require_auth();
         // --- Checks ---
+        require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_DEPOSIT_MINT);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &receiver);
         require_kyc_verified(e, &caller);
@@ -300,8 +375,9 @@ impl SingleRWAVault {
     ) -> i128 {
         caller.require_auth();
         // --- Checks ---
+        require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &owner);
         require_not_blacklisted(e, &receiver);
@@ -351,8 +427,9 @@ impl SingleRWAVault {
     ) -> i128 {
         caller.require_auth();
         // --- Checks ---
+        require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &owner);
         require_not_blacklisted(e, &receiver);
@@ -401,6 +478,29 @@ impl SingleRWAVault {
     }
     pub fn preview_redeem(e: &Env, shares: i128) -> i128 {
         preview_redeem(e, shares)
+    }
+
+    // ERC-4626 pure conversion helpers (floor division)
+    // ─────────────────────────────────────────────────────────────────
+
+    pub fn convert_to_shares(e: &Env, assets: i128) -> i128 {
+        let supply = get_total_supply(e);
+        let ta = total_assets(e);
+        if supply == 0 || ta == 0 {
+            return assets;
+        }
+        // shares = assets * totalSupply / totalAssets (floor)
+        math::mul_div(e, assets, supply, ta)
+    }
+
+    pub fn convert_to_assets(e: &Env, shares: i128) -> i128 {
+        let supply = get_total_supply(e);
+        let ta = total_assets(e);
+        if supply == 0 {
+            return shares;
+        }
+        // assets = shares * totalAssets / totalSupply (floor)
+        math::mul_div(e, shares, ta, supply)
     }
 
     pub fn redemption_request(e: &Env, request_id: u32) -> RedemptionRequest {
@@ -488,9 +588,11 @@ impl SingleRWAVault {
     pub fn distribute_yield(e: &Env, caller: Address, amount: i128) -> u32 {
         caller.require_auth();
         // --- Checks ---
+        require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
-        require_operator(e, &caller);
+        require_not_frozen(e, Self::FREEZE_YIELD);
+        // YieldOperator role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::YieldOperator);
         require_state(e, VaultState::Active);
 
         if amount <= 0 {
@@ -524,8 +626,9 @@ impl SingleRWAVault {
     pub fn claim_yield(e: &Env, caller: Address) -> i128 {
         caller.require_auth();
         // --- Checks ---
+        require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_YIELD);
         require_active_or_matured(e);
         require_not_blacklisted(e, &caller);
 
@@ -563,7 +666,7 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_YIELD);
         require_active_or_matured(e);
         require_not_blacklisted(e, &caller);
 
@@ -619,7 +722,7 @@ impl SingleRWAVault {
         if total_shares == 0 || user_shares == 0 {
             return 0;
         }
-        (get_epoch_yield(e, epoch) * user_shares) / total_shares
+        math::mul_div(e, get_epoch_yield(e, epoch), user_shares, total_shares)
     }
 
     pub fn current_epoch(e: &Env) -> u32 {
@@ -755,7 +858,8 @@ impl SingleRWAVault {
 
     pub fn activate_vault(e: &Env, operator: Address) {
         operator.require_auth();
-        require_operator(e, &operator);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &operator, Role::LifecycleManager);
         require_state(e, VaultState::Funding);
         // Cannot activate once the funding deadline has passed.
         let deadline = get_funding_deadline(e);
@@ -778,7 +882,8 @@ impl SingleRWAVault {
     /// Transitions the vault to Cancelled, enabling individual `refund` calls.
     pub fn cancel_funding(e: &Env, caller: Address) {
         caller.require_auth();
-        require_operator(e, &caller);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::LifecycleManager);
         require_state(e, VaultState::Funding);
         // Deadline must have passed.
         let deadline = get_funding_deadline(e);
@@ -806,7 +911,7 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_state(e, VaultState::Cancelled);
 
         let shares = get_share_balance(e, &caller);
@@ -840,7 +945,8 @@ impl SingleRWAVault {
     /// Transition Active → Matured.  Requires block timestamp ≥ maturityDate.
     pub fn mature_vault(e: &Env, caller: Address) {
         caller.require_auth();
-        require_operator(e, &caller);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::LifecycleManager);
         require_state(e, VaultState::Active);
         let now = e.ledger().timestamp();
         if now < get_maturity_date(e) {
@@ -857,7 +963,8 @@ impl SingleRWAVault {
     /// Closed is a terminal state; no further operations are possible.
     pub fn close_vault(e: &Env, caller: Address) {
         caller.require_auth();
-        require_operator(e, &caller);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::LifecycleManager);
         require_state(e, VaultState::Matured);
 
         if get_total_supply(e) > 0 {
@@ -871,7 +978,8 @@ impl SingleRWAVault {
 
     pub fn set_maturity_date(e: &Env, caller: Address, timestamp: u64) {
         caller.require_auth();
-        require_operator(e, &caller);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::LifecycleManager);
         require_not_closed(e);
         put_maturity_date(e, timestamp);
         emit_maturity_date_set(e, timestamp);
@@ -912,7 +1020,8 @@ impl SingleRWAVault {
 
     pub fn set_deposit_limits(e: &Env, caller: Address, min_amount: i128, max_amount: i128) {
         caller.require_auth();
-        require_operator(e, &caller);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::LifecycleManager);
         put_min_deposit(e, min_amount);
         put_max_deposit_per_user(e, max_amount);
         emit_deposit_limits_updated(e, min_amount, max_amount);
@@ -938,7 +1047,7 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &owner);
         require_not_blacklisted(e, &receiver);
@@ -999,7 +1108,7 @@ impl SingleRWAVault {
     /// Request early redemption (pending operator approval).
     pub fn request_early_redemption(e: &Env, caller: Address, shares: i128) -> u32 {
         caller.require_auth();
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_closed(e);
         require_not_blacklisted(e, &caller);
 
@@ -1048,7 +1157,8 @@ impl SingleRWAVault {
         operator.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_operator(e, &operator);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &operator, Role::LifecycleManager);
 
         let mut req = get_redemption_request(e, request_id);
         if req.processed {
@@ -1071,7 +1181,7 @@ impl SingleRWAVault {
 
         let assets = preview_redeem(e, req.shares);
         let fee_bps = get_early_redemption_fee_bps(e) as i128;
-        let fee = (assets * fee_bps) / 10000;
+        let fee = math::mul_div(e, assets, fee_bps, 10000);
         let net_assets = assets - fee;
         put_total_deposited(e, get_total_deposited(e) - net_assets);
 
@@ -1119,7 +1229,8 @@ impl SingleRWAVault {
     /// Operator rejects an early redemption request and returns shares from escrow.
     pub fn reject_early_redemption(e: &Env, operator: Address, request_id: u32) {
         operator.require_auth();
-        require_operator(e, &operator);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &operator, Role::LifecycleManager);
 
         let mut req = get_redemption_request(e, request_id);
         if req.processed {
@@ -1154,7 +1265,8 @@ impl SingleRWAVault {
     /// Set the early redemption fee (only by operator).
     pub fn set_early_redemption_fee(e: &Env, operator: Address, fee_bps: u32) {
         operator.require_auth();
-        require_operator(e, &operator);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &operator, Role::LifecycleManager);
         require_not_closed(e);
         if fee_bps > 1000 {
             panic_with_error!(e, Error::FeeTooHigh);
@@ -1172,16 +1284,49 @@ impl SingleRWAVault {
         get_admin(e)
     }
 
-    pub fn is_operator(e: &Env, account: Address) -> bool {
-        get_operator(e, &account)
+    /// Grant `role` to `addr`.  Only the admin may grant roles.
+    ///
+    /// `FullOperator` is the backward-compatible superrole and passes every
+    /// role check — equivalent to the old `set_operator(..., true)`.
+    pub fn grant_role(e: &Env, caller: Address, addr: Address, role: Role) {
+        caller.require_auth();
+        require_admin(e, &caller);
+        put_role(e, addr.clone(), role.clone(), true);
+        emit_role_granted(e, addr, role);
+        bump_instance(e);
     }
 
+    /// Revoke `role` from `addr`.  Only the admin may revoke roles.
+    pub fn revoke_role(e: &Env, caller: Address, addr: Address, role: Role) {
+        caller.require_auth();
+        require_admin(e, &caller);
+        put_role(e, addr.clone(), role.clone(), false);
+        emit_role_revoked(e, addr, role);
+        bump_instance(e);
+    }
+
+    /// Returns `true` when `addr` holds `role`, the `FullOperator` superrole,
+    /// or is the admin.
+    pub fn has_role(e: &Env, addr: Address, role: Role) -> bool {
+        if addr == get_admin(e) {
+            return true;
+        }
+        get_role(e, &addr, Role::FullOperator) || get_role(e, &addr, role)
+    }
+
+    /// Backward-compatible: grants or revokes the `FullOperator` superrole.
+    /// Prefer `grant_role` / `revoke_role` for new integrations.
     pub fn set_operator(e: &Env, caller: Address, operator: Address, status: bool) {
         caller.require_auth();
         require_admin(e, &caller);
         put_operator(e, operator.clone(), status);
         emit_operator_updated(e, operator, status);
         bump_instance(e);
+    }
+
+    /// Backward-compatible: returns `true` when `account` holds `FullOperator`.
+    pub fn is_operator(e: &Env, account: Address) -> bool {
+        get_operator(e, &account)
     }
 
     pub fn transfer_admin(e: &Env, caller: Address, new_admin: Address) {
@@ -1199,7 +1344,8 @@ impl SingleRWAVault {
 
     pub fn set_blacklisted(e: &Env, caller: Address, address: Address, status: bool) {
         caller.require_auth();
-        require_admin(e, &caller);
+        // ComplianceOfficer role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::ComplianceOfficer);
         put_blacklisted(e, &address, status);
         emit_address_blacklisted(e, address, status);
         bump_instance(e);
@@ -1221,7 +1367,8 @@ impl SingleRWAVault {
     /// Toggle the transfer KYC requirement.  Only the admin may change this.
     pub fn set_transfer_requires_kyc(e: &Env, caller: Address, enabled: bool) {
         caller.require_auth();
-        require_admin(e, &caller);
+        // ComplianceOfficer role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::ComplianceOfficer);
         put_transfer_requires_kyc(e, enabled);
         bump_instance(e);
     }
@@ -1232,8 +1379,10 @@ impl SingleRWAVault {
 
     pub fn pause(e: &Env, caller: Address, reason: String) {
         caller.require_auth();
-        require_operator(e, &caller);
+        // TreasuryManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::TreasuryManager);
         put_paused(e, true);
+        put_freeze_flags(e, Self::FREEZE_ALL);
         emit_emergency_action(e, true, reason);
         bump_instance(e);
     }
@@ -1247,12 +1396,25 @@ impl SingleRWAVault {
         caller.require_auth();
         require_admin(e, &caller);
         put_paused(e, false);
+        put_freeze_flags(e, 0u32);
         emit_emergency_action(e, false, String::from_str(e, ""));
         bump_instance(e);
     }
 
     pub fn paused(e: &Env) -> bool {
         get_paused(e)
+    }
+
+    pub fn freeze_flags(e: &Env) -> u32 {
+        get_freeze_flags(e)
+    }
+
+    pub fn set_freeze_flags(e: &Env, caller: Address, flags: u32) {
+        caller.require_auth();
+        // TreasuryManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::TreasuryManager);
+        put_freeze_flags(e, flags);
+        bump_instance(e);
     }
 
     /// Drain all vault assets to `recipient` and pause the vault.
@@ -1264,12 +1426,14 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_admin(e, &caller);
+        // TreasuryManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::TreasuryManager);
 
         let balance = asset_balance_of_vault(e);
 
         // --- Effects (pause before transferring) ---
         put_paused(e, true);
+        put_freeze_flags(e, Self::FREEZE_ALL);
         emit_emergency_action(
             e,
             true,
@@ -1290,9 +1454,129 @@ impl SingleRWAVault {
         release_lock(e);
     }
 
+    /// Enable emergency pro-rata distribution mode.
+    ///
+    /// This transitions the vault to the Emergency state, snapshots the current
+    /// vault balance and total supply, and allows each user to individually
+    /// claim their proportional share of remaining assets.
+    ///
+    /// Admin-only. Once enabled, users call `emergency_claim` to withdraw.
+    pub fn emergency_enable_pro_rata(e: &Env, caller: Address) {
+        caller.require_auth();
+        acquire_lock(e);
+        require_admin(e, &caller);
+
+        let balance = asset_balance_of_vault(e);
+        let supply = get_total_supply(e);
+
+        if supply == 0 {
+            panic_with_error!(e, Error::ZeroAmount);
+        }
+
+        let old_state = get_vault_state(e);
+        put_vault_state(e, VaultState::Emergency);
+        put_emergency_balance(e, balance);
+        put_emergency_total_supply_snapshot(e, supply);
+        put_paused(e, true);
+
+        emit_vault_state_changed(e, old_state, VaultState::Emergency);
+        emit_emergency_mode_enabled(e, balance, supply);
+        bump_instance(e);
+        release_lock(e);
+    }
+
+    /// Claim pro-rata share of vault assets in Emergency state.
+    ///
+    /// Each user can call this once to receive: emergency_balance * user_shares / total_supply_snapshot
+    /// Shares are burned upon claiming.
+    pub fn emergency_claim(e: &Env, caller: Address) -> i128 {
+        caller.require_auth();
+        acquire_lock(e);
+
+        if get_vault_state(e) != VaultState::Emergency {
+            panic_with_error!(e, Error::NotInEmergency);
+        }
+        if get_has_claimed_emergency(e, &caller) {
+            panic_with_error!(e, Error::AlreadyClaimedEmergency);
+        }
+
+        let user_shares = get_share_balance(e, &caller);
+        if user_shares == 0 {
+            panic_with_error!(e, Error::ZeroAmount);
+        }
+
+        let emergency_balance = get_emergency_balance(e);
+        let total_supply_snapshot = get_emergency_total_supply_snapshot(e);
+
+        let claim_amount = (emergency_balance * user_shares) / total_supply_snapshot;
+
+        put_has_claimed_emergency(e, &caller, true);
+        _burn(e, &caller, user_shares);
+
+        if claim_amount > 0 {
+            transfer_asset_from_vault(e, &caller, claim_amount);
+        }
+
+        emit_emergency_claimed(e, caller, claim_amount);
+        bump_instance(e);
+        release_lock(e);
+        claim_amount
+    }
+
+    /// View function: calculate a user's pending emergency claim amount.
+    pub fn pending_emergency_claim(e: &Env, user: Address) -> i128 {
+        if get_vault_state(e) != VaultState::Emergency {
+            return 0;
+        }
+        if get_has_claimed_emergency(e, &user) {
+            return 0;
+        }
+
+        let user_shares = get_share_balance(e, &user);
+        if user_shares == 0 {
+            return 0;
+        }
+
+        let emergency_balance = get_emergency_balance(e);
+        let total_supply_snapshot = get_emergency_total_supply_snapshot(e);
+
+        if total_supply_snapshot == 0 {
+            return 0;
+        }
+
+        (emergency_balance * user_shares) / total_supply_snapshot
+    }
+
     // ─────────────────────────────────────────────────────────────────
-    // View helpers
+    // Versioning and migration
     // ─────────────────────────────────────────────────────────────────
+
+    /// Admin-only migration entry point. Updates storage schema to the latest version.
+    /// Emits DataMigrated event. No-op if already up-to-date.
+    pub fn migrate(e: &Env, caller: Address) {
+        caller.require_auth();
+        require_admin(e, &caller);
+
+        let old_version = get_storage_schema_version(e);
+        if old_version >= CURRENT_SCHEMA_VERSION {
+            // Already up-to-date; no-op
+            return;
+        }
+
+        crate::migrations::run_migrations(e, old_version);
+        emit_data_migrated(e, old_version, CURRENT_SCHEMA_VERSION);
+        bump_instance(e);
+    }
+
+    /// Returns the current storage schema version.
+    pub fn storage_schema_version(e: &Env) -> u32 {
+        get_storage_schema_version(e)
+    }
+
+    /// Returns the contract’s immutable code version.
+    pub fn contract_version(e: &Env) -> u32 {
+        get_contract_version(e)
+    }
 
     pub fn asset(e: &Env) -> Address {
         get_asset(e)
@@ -1335,7 +1619,8 @@ impl SingleRWAVault {
     }
     pub fn set_funding_target(e: &Env, caller: Address, target: i128) {
         caller.require_auth();
-        require_operator(e, &caller);
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::LifecycleManager);
         put_funding_target(e, target);
         emit_funding_target_set(e, target);
         bump_instance(e);
@@ -1410,6 +1695,13 @@ impl SingleRWAVault {
     pub fn burn(e: &Env, from: Address, amount: i128) {
         from.require_auth();
         update_user_snapshot(e, &from);
+        // --- Effects ---
+        // Snapshot user and auto-claim pending yield to prevent accounting loss
+        update_user_snapshot(e, &from);
+        let pending = Self::pending_yield(e, from.clone());
+        if pending > 0 {
+            claim_yield_no_auth(e, &from);
+        }
         _burn(e, &from, amount);
         emit_burn(e, from, amount);
         bump_instance(e);
@@ -1423,6 +1715,13 @@ impl SingleRWAVault {
         }
         put_share_allowance(e, &from, &spender, allowance - amount);
         update_user_snapshot(e, &from);
+        // --- Effects ---
+        // Snapshot user and auto-claim pending yield to prevent accounting loss
+        update_user_snapshot(e, &from);
+        let pending = Self::pending_yield(e, from.clone());
+        if pending > 0 {
+            claim_yield_no_auth(e, &from);
+        }
         _burn(e, &from, amount);
         emit_burn(e, from, amount);
         bump_instance(e);
@@ -1457,7 +1756,7 @@ fn preview_deposit(e: &Env, assets: i128) -> i128 {
         return assets;
     }
     // shares = assets * totalSupply / totalAssets
-    assets * supply / ta
+    math::mul_div(e, assets, supply, ta)
 }
 
 fn preview_mint(e: &Env, shares: i128) -> i128 {
@@ -1467,7 +1766,7 @@ fn preview_mint(e: &Env, shares: i128) -> i128 {
         return shares;
     }
     // assets = shares * totalAssets / totalSupply  (ceil)
-    (shares * ta + supply - 1) / supply
+    math::mul_div_ceil(e, shares, ta, supply)
 }
 
 fn preview_withdraw(e: &Env, assets: i128) -> i128 {
@@ -1477,7 +1776,7 @@ fn preview_withdraw(e: &Env, assets: i128) -> i128 {
         return assets;
     }
     // shares = assets * totalSupply / totalAssets  (ceil)
-    (assets * supply + ta - 1) / ta
+    math::mul_div_ceil(e, assets, supply, ta)
 }
 
 fn preview_redeem(e: &Env, shares: i128) -> i128 {
@@ -1493,7 +1792,7 @@ fn preview_redeem(e: &Env, shares: i128) -> i128 {
     // _burn subtracts from total_supply.
     // My request_early_redemption does NOT _burn, so total_supply is unchanged.
     // So total_supply ALREADY includes escrowed shares.
-    shares * ta / supply
+    math::mul_div(e, shares, ta, supply)
 }
 
 fn asset_balance_of_vault(e: &Env) -> i128 {
@@ -1578,20 +1877,77 @@ fn _get_user_shares_for_epoch(e: &Env, user: &Address, epoch: u32) -> i128 {
 // Guard helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Require that storage schema is current; panics with MigrationRequired otherwise.
+/// Skipped for migrate, version, and admin functions.
+fn require_current_schema(e: &Env) {
+    if get_storage_schema_version(e) != CURRENT_SCHEMA_VERSION {
+        panic_with_error!(e, Error::MigrationRequired);
+    }
+}
+
+/// Internal yield claim helper that performs the same state transitions as
+/// `claim_yield` but skips `require_auth`.
+///
+/// Used by `burn`/`burn_from` to prevent loss of pending yield when shares are
+/// burned.
+fn claim_yield_no_auth(e: &Env, caller: &Address) {
+    // --- Checks ---
+    require_current_schema(e);
+    acquire_lock(e);
+    require_not_frozen(e, SingleRWAVault::FREEZE_YIELD);
+    require_active_or_matured(e);
+    require_not_blacklisted(e, caller);
+
+    let amount = SingleRWAVault::pending_yield(e, caller.clone());
+    if amount <= 0 {
+        release_lock(e);
+        return;
+    }
+
+    // --- Effects ---
+    let epoch = get_current_epoch(e);
+    for i in 1..=epoch {
+        if !get_has_claimed_epoch(e, caller, i) && _get_user_shares_for_epoch(e, caller, i) > 0 {
+            put_has_claimed_epoch(e, caller, i, true);
+        }
+    }
+
+    put_total_yield_claimed(e, caller, get_total_yield_claimed(e, caller) + amount);
+    transfer_asset_from_vault(e, caller, amount);
+
+    emit_yield_claimed(e, caller.clone(), amount, epoch);
+    bump_instance(e);
+    release_lock(e);
+}
+
 fn require_admin(e: &Env, caller: &Address) {
     if *caller != get_admin(e) {
         panic_with_error!(e, Error::NotAdmin);
     }
 }
 
-fn require_operator(e: &Env, caller: &Address) {
-    if !get_operator(e, caller) && *caller != get_admin(e) {
+/// Passes when `caller` holds `role`, the `FullOperator` superrole, or is admin.
+///
+/// Role hierarchy (most to least privileged):
+/// - Admin → always authorised
+/// - FullOperator → backward-compatible superrole; passes every role check
+/// - Named role → passes only the matching role check
+fn require_role(e: &Env, caller: &Address, role: Role) {
+    if *caller == get_admin(e) {
+        return;
+    }
+    if get_role(e, caller, Role::FullOperator) {
+        return;
+    }
+    if !get_role(e, caller, role) {
         panic_with_error!(e, Error::NotOperator);
     }
 }
 
-fn require_not_paused(e: &Env) {
-    if get_paused(e) {
+fn require_not_frozen(e: &Env, flag: u32) {
+    let flags = get_freeze_flags(e);
+    if (flags & flag) != 0 {
+        // Reuse VaultPaused error for backwards compatibility with existing tests.
         panic_with_error!(e, Error::VaultPaused);
     }
 }
@@ -1820,6 +2176,8 @@ mod test_escrow;
 #[cfg(test)]
 pub mod test_helpers;
 #[cfg(test)]
+mod test_rbac;
+#[cfg(test)]
 mod test_redemption;
 #[cfg(test)]
 mod test_withdraw;
@@ -1827,8 +2185,15 @@ mod test_withdraw;
 mod tests;
 
 #[cfg(test)]
+mod test_freeze_flags;
+
+#[cfg(test)]
 mod test_close_vault;
 #[cfg(test)]
 mod test_constructor_validation;
+#[cfg(test)]
+mod test_overflow;
+#[cfg(test)]
+mod test_rwa_setters;
 #[cfg(test)]
 mod test_token;
