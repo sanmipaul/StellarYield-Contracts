@@ -11,19 +11,53 @@ mod types;
 #[cfg(test)]
 mod fuzz_tests;
 #[cfg(test)]
+mod test_helpers;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod test_access_control;
+#[cfg(test)]
 mod test_burn_snapshot;
 #[cfg(test)]
 mod test_burn_yield_accounting;
 #[cfg(test)]
 mod test_claim_cursor;
 #[cfg(test)]
+mod test_close_vault;
+#[cfg(test)]
+mod test_constructor;
+#[cfg(test)]
+mod test_constructor_validation;
+#[cfg(test)]
 mod test_convert_erc4626;
 #[cfg(test)]
+mod test_deposit_limits;
+#[cfg(test)]
 mod test_epoch_history;
+#[cfg(test)]
+mod test_escrow;
+#[cfg(test)]
+mod test_freeze_flags;
 #[cfg(test)]
 mod test_funding_deadline;
 #[cfg(test)]
 mod test_lifecycle;
+#[cfg(test)]
+mod test_multisig_emergency;
+#[cfg(test)]
+mod test_overflow;
+#[cfg(test)]
+mod test_rbac;
+#[cfg(test)]
+mod test_redemption;
+#[cfg(test)]
+mod test_rwa_setters;
+#[cfg(test)]
+mod test_token;
+#[cfg(test)]
+mod test_vault_state_guards;
+#[cfg(test)]
+mod test_withdraw;
 
 pub use crate::types::*;
 
@@ -52,6 +86,9 @@ impl SingleRWAVault {
     pub const FREEZE_YIELD: u32 = 4;
     pub const FREEZE_ALL: u32 =
         Self::FREEZE_DEPOSIT_MINT | Self::FREEZE_WITHDRAW_REDEEM | Self::FREEZE_YIELD;
+
+    /// Timeout for emergency proposals: 24 hours in seconds.
+    pub const EMERGENCY_PROPOSAL_TIMEOUT: u64 = 86400;
 
     // ─────────────────────────────────────────────────────────────────
     // Constructor
@@ -1494,6 +1531,11 @@ impl SingleRWAVault {
 
     /// Drain all vault assets to `recipient` and pause the vault.
     ///
+    /// If no multi-sig signers are configured, falls back to single-admin
+    /// behaviour (TreasuryManager or admin required).  When multi-sig is
+    /// configured this function panics — use `propose_emergency_withdraw` /
+    /// `approve_emergency_withdraw` / `execute_emergency_withdraw` instead.
+    ///
     /// Security: follows CEI — the vault is paused (Effect) before the asset
     /// transfer (Interaction) so that any reentrant call is rejected by
     /// `require_not_paused`.  Reentrancy lock provides an additional hard stop.
@@ -1501,6 +1543,13 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
+
+        // If multi-sig is configured, single-key path is disabled.
+        if get_emergency_signers(e).is_some() {
+            release_lock(e);
+            panic_with_error!(e, Error::NotSupported);
+        }
+
         // TreasuryManager role required — also passes for FullOperator and admin.
         require_role(e, &caller, Role::TreasuryManager);
 
@@ -1519,12 +1568,137 @@ impl SingleRWAVault {
         if balance > 0 {
             transfer_asset_from_vault(e, &recipient, balance);
         }
+        bump_instance(e);
+        release_lock(e);
+    }
+
+    /// Configure the multi-sig signer set and approval threshold for
+    /// emergency withdrawals.  Admin-only.
+    ///
+    /// Setting signers to an empty vec clears the multi-sig configuration and
+    /// re-enables the single-admin `emergency_withdraw` fallback.
+    pub fn set_emergency_signers(e: &Env, caller: Address, signers: Vec<Address>, threshold: u32) {
+        caller.require_auth();
+        require_admin(e, &caller);
+
+        if signers.is_empty() {
+            // Clear multi-sig; restore single-admin fallback.
+            remove_emergency_signers(e);
+            remove_emergency_threshold(e);
+            bump_instance(e);
+            return;
+        }
+
+        if threshold == 0 || threshold > signers.len() {
+            panic_with_error!(e, Error::InvalidThreshold);
+        }
+
+        put_emergency_signers(e, signers);
+        put_emergency_threshold(e, threshold);
+        bump_instance(e);
+    }
+
+    /// Any configured emergency signer may propose a withdrawal to `recipient`.
+    /// Returns the new proposal ID.
+    pub fn propose_emergency_withdraw(e: &Env, caller: Address, recipient: Address) -> u32 {
+        caller.require_auth();
+        require_emergency_signer(e, &caller);
+
+        let proposal_id = increment_emergency_proposal_counter(e);
+        let proposal = EmergencyProposal {
+            recipient: recipient.clone(),
+            proposed_at: e.ledger().timestamp(),
+            executed: false,
+        };
+        put_emergency_proposal(e, proposal_id, proposal);
+
+        // Proposer implicitly approves.
+        let mut approvals: Vec<Address> = Vec::new(e);
+        approvals.push_back(caller.clone());
+        put_emergency_proposal_approvals(e, proposal_id, approvals);
+
+        emit_emergency_proposed(e, proposal_id, caller, recipient);
+        bump_instance(e);
+        proposal_id
+    }
+
+    /// A configured emergency signer approves proposal `proposal_id`.
+    pub fn approve_emergency_withdraw(e: &Env, caller: Address, proposal_id: u32) {
+        caller.require_auth();
+        require_emergency_signer(e, &caller);
+
+        let proposal = get_emergency_proposal(e, proposal_id)
+            .unwrap_or_else(|| panic_with_error!(e, Error::ProposalNotFound));
+
+        if proposal.executed {
+            panic_with_error!(e, Error::ProposalAlreadyExecuted);
+        }
+
+        let now = e.ledger().timestamp();
+        if now > proposal.proposed_at + Self::EMERGENCY_PROPOSAL_TIMEOUT {
+            panic_with_error!(e, Error::ProposalExpired);
+        }
+
+        let mut approvals = get_emergency_proposal_approvals(e, proposal_id);
+        // Ensure no double-approval.
+        for i in 0..approvals.len() {
+            if approvals.get(i).unwrap() == caller {
+                panic_with_error!(e, Error::AlreadyApproved);
+            }
+        }
+
+        approvals.push_back(caller.clone());
+        let count = approvals.len();
+        put_emergency_proposal_approvals(e, proposal_id, approvals);
+
+        emit_emergency_approved(e, proposal_id, caller, count);
+        bump_instance(e);
+    }
+
+    /// Execute proposal `proposal_id` once the approval threshold is met.
+    /// Any signer may call this; the proposal must not be expired or already executed.
+    pub fn execute_emergency_withdraw(e: &Env, caller: Address, proposal_id: u32) {
+        caller.require_auth();
+        require_emergency_signer(e, &caller);
+        acquire_lock(e);
+
+        let mut proposal = get_emergency_proposal(e, proposal_id)
+            .unwrap_or_else(|| panic_with_error!(e, Error::ProposalNotFound));
+
+        if proposal.executed {
+            release_lock(e);
+            panic_with_error!(e, Error::ProposalAlreadyExecuted);
+        }
+
+        let now = e.ledger().timestamp();
+        if now > proposal.proposed_at + Self::EMERGENCY_PROPOSAL_TIMEOUT {
+            release_lock(e);
+            panic_with_error!(e, Error::ProposalExpired);
+        }
+
+        let approvals = get_emergency_proposal_approvals(e, proposal_id);
+        let threshold = get_emergency_threshold(e);
+        if approvals.len() < threshold {
+            release_lock(e);
+            panic_with_error!(e, Error::ThresholdNotMet);
+        }
+
+        // Mark executed before transferring (CEI pattern).
+        proposal.executed = true;
+        put_emergency_proposal(e, proposal_id, proposal.clone());
+
+        let balance = asset_balance_of_vault(e);
+
+        // --- Effects ---
         put_paused(e, true);
-        emit_emergency_action(
-            e,
-            true,
-            String::from_str(e, "Emergency withdrawal executed"),
-        );
+        put_freeze_flags(e, Self::FREEZE_ALL);
+
+        // --- Interaction ---
+        if balance > 0 {
+            transfer_asset_from_vault(e, &proposal.recipient, balance);
+        }
+
+        emit_emergency_executed(e, proposal_id, proposal.recipient, balance);
         bump_instance(e);
         release_lock(e);
     }
@@ -2037,6 +2211,22 @@ fn release_lock(e: &Env) {
     put_locked(e, false);
 }
 
+/// Panics with `NotEmergencySigner` if `caller` is not in the emergency signers list.
+fn require_emergency_signer(e: &Env, caller: &Address) {
+    let signers = get_emergency_signers(e)
+        .unwrap_or_else(|| panic_with_error!(e, Error::NotEmergencySigner));
+    let mut found = false;
+    for i in 0..signers.len() {
+        if signers.get(i).unwrap() == *caller {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        panic_with_error!(e, Error::NotEmergencySigner);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -2195,35 +2385,3 @@ mod test {
     }
 }
 
-#[cfg(test)]
-mod test_access_control;
-#[cfg(test)]
-mod test_constructor;
-#[cfg(test)]
-mod test_escrow;
-#[cfg(test)]
-pub mod test_helpers;
-#[cfg(test)]
-mod test_rbac;
-#[cfg(test)]
-mod test_redemption;
-#[cfg(test)]
-mod test_withdraw;
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod test_freeze_flags;
-
-#[cfg(test)]
-mod test_close_vault;
-#[cfg(test)]
-mod test_constructor_validation;
-#[cfg(test)]
-mod test_deposit_limits;
-#[cfg(test)]
-mod test_overflow;
-#[cfg(test)]
-mod test_rwa_setters;
-#[cfg(test)]
-mod test_token;

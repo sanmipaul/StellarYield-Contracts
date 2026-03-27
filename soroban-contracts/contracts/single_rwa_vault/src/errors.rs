@@ -56,4 +56,18 @@ pub enum Error {
     /// Burn requires pending yield to be claimed first (Option A).
     BurnRequiresYieldClaim = 32,
     InvalidDepositLimits = 33,
+    /// Caller is not in the emergency signers list.
+    NotEmergencySigner = 34,
+    /// The referenced emergency proposal does not exist.
+    ProposalNotFound = 35,
+    /// The emergency proposal has passed its expiry timeout.
+    ProposalExpired = 36,
+    /// The emergency proposal has already been executed.
+    ProposalAlreadyExecuted = 37,
+    /// Approval threshold has not been reached yet.
+    ThresholdNotMet = 38,
+    /// This signer has already approved this proposal.
+    AlreadyApproved = 39,
+    /// Threshold must be >= 1 and <= number of signers.
+    InvalidThreshold = 40,
 }
