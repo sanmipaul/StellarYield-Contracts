@@ -6,7 +6,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    storage::{get_vault_count, get_vault_info, put_vault_info, register_vault, get_vault_at_index},
+    storage::{get_vault_count, get_vault_info, put_vault_info, register_vault},
     types::{VaultInfo, VaultType},
     VaultFactory, VaultFactoryClient,
 };

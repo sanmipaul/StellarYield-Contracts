@@ -47,6 +47,8 @@ mod test_helpers;
 #[cfg(test)]
 mod test_lifecycle;
 #[cfg(test)]
+mod test_multiple_deposit_times;
+#[cfg(test)]
 mod test_multisig_emergency;
 #[cfg(test)]
 mod test_overflow;
@@ -64,8 +66,6 @@ mod test_vault_state_guards;
 mod test_withdraw;
 #[cfg(test)]
 mod test_yield_vesting;
-#[cfg(test)]
-mod test_multiple_deposit_times;
 #[cfg(test)]
 mod tests;
 
@@ -2117,7 +2117,7 @@ impl SingleRWAVault {
             return get_expected_apy(e);
         }
         const SECONDS_PER_YEAR: u64 = 31_536_000;
-        let numerator = (ytd as i128)
+        let numerator = ytd
             .checked_mul(SECONDS_PER_YEAR as i128)
             .and_then(|v| v.checked_mul(10000))
             .unwrap_or(i128::MAX);

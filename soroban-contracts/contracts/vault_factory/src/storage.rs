@@ -276,4 +276,3 @@ pub fn remove_from_vaults_by_asset(e: &Env, asset: &Address, vault: &Address) {
         .set(&DataKey::VaultsByAsset(asset.clone()), &updated);
     bump_persist(e, &DataKey::VaultsByAsset(asset.clone()));
 }
-
