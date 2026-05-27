@@ -7,19 +7,41 @@ use soroban_sdk::{
 
 use crate::{
     storage::{
-        get_active_vaults, get_all_vaults, get_single_rwa_vaults, get_vault_count, get_vault_info,
-        push_active_vaults, push_all_vaults, push_single_rwa_vaults, put_vault_info,
+        get_vault_count, get_vault_info, increment_vault_deploy_counter, put_vault_by_deploy_id,
+        put_vault_info, register_vault,
     },
     types::{VaultInfo, VaultType},
     VaultFactory, VaultFactoryClient,
 };
+
+use single_rwa_vault::SingleRWAVaultClient;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test Context
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Unused test context - kept for potential future use
+#[allow(dead_code)]
+pub struct TestContext {
+    pub env: Env,
+    pub factory_id: Address,
+    pub admin: Address,
+    pub asset_id: Address,
+}
+
+#[allow(dead_code)]
+impl TestContext {
+    pub fn factory(&self) -> VaultFactoryClient<'_> {
+        VaultFactoryClient::new(&self.env, &self.factory_id)
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Deploy and initialise a VaultFactory with a dummy WASM hash.
-pub fn setup_factory(e: &Env) -> (VaultFactoryClient<'_>, Address) {
+pub fn setup_factory(e: &Env) -> (Address, Address) {
     let admin = Address::generate(e);
     let asset = Address::generate(e);
     let zkme = Address::generate(e);
@@ -36,7 +58,46 @@ pub fn setup_factory(e: &Env) -> (VaultFactoryClient<'_>, Address) {
             wasm_hash,
         ),
     );
-    (VaultFactoryClient::new(e, &factory_id), admin)
+    (factory_id, admin)
+}
+
+/// Setup a test context with factory and necessary addresses.
+#[allow(dead_code)]
+pub fn setup_test_context() -> TestContext {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (factory_id, admin) = setup_factory(&env);
+    let asset_id = Address::generate(&env);
+
+    TestContext {
+        env,
+        factory_id,
+        admin,
+        asset_id,
+    }
+}
+
+#[allow(dead_code)]
+fn create_default_vault(ctx: &TestContext) -> (Address, SingleRWAVaultClient<'_>) {
+    let factory = ctx.factory();
+
+    // Use a future maturity date
+    let maturity = ctx.env.ledger().timestamp() + 1_000_000;
+
+    let vault_addr = factory.create_single_rwa_vault(
+        &ctx.admin,
+        &ctx.asset_id,
+        &soroban_sdk::String::from_str(&ctx.env, "Test Vault"),
+        &soroban_sdk::String::from_str(&ctx.env, "TVLT"),
+        &soroban_sdk::String::from_str(&ctx.env, "Test RWA"),
+        &soroban_sdk::String::from_str(&ctx.env, "TRWA"),
+        &soroban_sdk::String::from_str(&ctx.env, "ipfs://test"),
+        &maturity,
+    );
+
+    let vault_client = SingleRWAVaultClient::new(&ctx.env, &vault_addr);
+
+    (vault_addr, vault_client)
 }
 
 /// Inject a vault record directly into factory storage, bypassing deployment.
@@ -58,13 +119,18 @@ fn inject_vault(e: &Env, factory_id: &Address, active: bool) -> Address {
     // against the factory address.
     e.as_contract(factory_id, || {
         put_vault_info(e, &vault, info);
-        push_all_vaults(e, vault.clone());
-        push_single_rwa_vaults(e, vault.clone());
-        if active {
-            push_active_vaults(e, vault.clone());
-        }
+        register_vault(e, vault.clone());
     });
 
+    vault
+}
+
+fn inject_vault_with_deploy_id(e: &Env, factory_id: &Address, active: bool) -> Address {
+    let vault = inject_vault(e, factory_id, active);
+    e.as_contract(factory_id, || {
+        let id = increment_vault_deploy_counter(e);
+        put_vault_by_deploy_id(e, id, &vault);
+    });
     vault
 }
 
@@ -75,8 +141,8 @@ fn test_get_vault_info_includes_underlying_asset() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     let vault = Address::generate(&e);
     let asset = Address::generate(&e);
@@ -103,6 +169,87 @@ fn test_get_vault_info_includes_underlying_asset() {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── Empty registry (#170) ───────────────────────────────────────────────────
+
+/// get_all_vaults returns an empty vec when no vaults have been created yet.
+#[test]
+fn test_get_all_vaults_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let all = client.get_all_vaults();
+    assert_eq!(
+        all.len(),
+        0,
+        "get_all_vaults must return an empty vec when the registry is empty"
+    );
+}
+
+/// get_active_vaults returns an empty vec when no vaults have been created yet.
+#[test]
+fn test_get_active_vaults_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let active = client.get_active_vaults();
+    assert_eq!(
+        active.len(),
+        0,
+        "get_active_vaults must return an empty vec when the registry is empty"
+    );
+}
+
+/// get_vault_count returns 0 when no vaults have been created yet.
+#[test]
+fn test_get_vault_count_is_zero_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    assert_eq!(
+        client.get_vault_count(),
+        0u32,
+        "vault count must be 0 when no vaults exist"
+    );
+}
+
+/// get_vaults_paginated returns an empty vec when the registry is empty.
+#[test]
+fn test_get_vaults_paginated_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let page = client.get_vaults_paginated(&0, &10);
+    assert_eq!(
+        page.len(),
+        0,
+        "get_vaults_paginated must return an empty vec when the registry is empty"
+    );
+}
+
+/// get_active_vaults_paginated returns an empty vec when the registry is empty.
+#[test]
+fn test_get_active_vaults_paginated_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let page = client.get_active_vaults_paginated(&0, &10);
+    assert_eq!(
+        page.len(),
+        0,
+        "get_active_vaults_paginated must return an empty vec when the registry is empty"
+    );
+}
+
 // ─── ActiveVaults list ────────────────────────────────────────────────────────
 
 /// set_vault_status keeps ActiveVaults in sync: deactivating removes,
@@ -112,27 +259,21 @@ fn test_set_vault_status_updates_active_list() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     let vault = inject_vault(&e, &factory_id, true);
 
     // Initially active — should appear in ActiveVaults.
-    e.as_contract(&factory_id, || {
-        assert!(get_active_vaults(&e).contains(vault.clone()));
-    });
+    assert!(client.get_active_vaults().contains(vault.clone()));
 
     // Deactivate — must be removed from ActiveVaults.
     client.set_vault_status(&admin, &vault, &false);
-    e.as_contract(&factory_id, || {
-        assert!(!get_active_vaults(&e).contains(vault.clone()));
-    });
+    assert!(!client.get_active_vaults().contains(vault.clone()));
 
     // Reactivate — must be re-added.
     client.set_vault_status(&admin, &vault, &true);
-    e.as_contract(&factory_id, || {
-        assert!(get_active_vaults(&e).contains(vault.clone()));
-    });
+    assert!(client.get_active_vaults().contains(vault.clone()));
 }
 
 /// get_active_vaults returns only the active list directly (O(1) read).
@@ -141,8 +282,8 @@ fn test_get_active_vaults_uses_dedicated_list() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     let a = inject_vault(&e, &factory_id, true);
     inject_vault(&e, &factory_id, false); // inactive
@@ -160,8 +301,8 @@ fn test_get_vault_count_tracks_adds_and_removes() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     assert_eq!(client.get_vault_count(), 0);
 
@@ -184,19 +325,62 @@ fn test_vault_count_matches_list_length() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     for _ in 0..5 {
         inject_vault(&e, &factory_id, true);
     }
 
+    let all = client.get_all_vaults();
     e.as_contract(&factory_id, || {
-        assert_eq!(
-            get_vault_count(&e) as usize,
-            get_all_vaults(&e).len() as usize
-        );
+        assert_eq!(get_vault_count(&e) as usize, all.len() as usize);
     });
+}
+
+/// vault_count() alias returns the same value as get_vault_count().
+#[test]
+fn test_vault_count_alias_matches_get_vault_count() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    // Both should return 0 initially
+    assert_eq!(client.vault_count(), 0);
+    assert_eq!(client.vault_count(), client.get_vault_count());
+
+    // Add some vaults
+    inject_vault(&e, &factory_id, true);
+    inject_vault(&e, &factory_id, false);
+
+    // Both should return the same count
+    assert_eq!(client.vault_count(), 2);
+    assert_eq!(client.vault_count(), client.get_vault_count());
+}
+
+/// Offset past the end of the active list returns an empty vec (#186).
+#[test]
+fn test_get_active_vaults_offset_out_of_range() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    // Create 3 active vaults
+    inject_vault(&e, &factory_id, true);
+    inject_vault(&e, &factory_id, true);
+    inject_vault(&e, &factory_id, true);
+
+    // Call with large offset
+    let page = client.get_active_vaults_paginated(&10, &5);
+    assert_eq!(
+        page.len(),
+        0,
+        "get_active_vaults_paginated must return empty vec for out-of-range offset"
+    );
 }
 
 // ─── get_vaults_paginated ─────────────────────────────────────────────────────
@@ -207,8 +391,8 @@ fn test_get_vaults_paginated_first_page() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     let mut all_vaults = soroban_sdk::Vec::new(&e);
     for _ in 0..5 {
@@ -227,8 +411,8 @@ fn test_get_vaults_paginated_second_page() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     let mut all_vaults = soroban_sdk::Vec::new(&e);
     for _ in 0..5 {
@@ -247,8 +431,8 @@ fn test_get_vaults_paginated_offset_past_end() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     inject_vault(&e, &factory_id, true);
     inject_vault(&e, &factory_id, true);
@@ -263,8 +447,8 @@ fn test_get_vaults_paginated_zero_limit() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     inject_vault(&e, &factory_id, true);
 
@@ -280,8 +464,8 @@ fn test_get_active_vaults_paginated_filters_inactive() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     let a1 = inject_vault(&e, &factory_id, true);
     inject_vault(&e, &factory_id, false); // inactive
@@ -303,8 +487,8 @@ fn test_get_active_vaults_paginated_offset_skips_active() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     inject_vault(&e, &factory_id, true); // active[0] — skipped by offset=1
     let a2 = inject_vault(&e, &factory_id, true); // active[1]
@@ -321,32 +505,36 @@ fn test_remove_inactive_vault_success() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     let vault = inject_vault(&e, &factory_id, false /* inactive */);
 
     // Pre-conditions
+    let all_pre = client.get_all_vaults();
+    let single_pre = client.get_single_rwa_vaults();
     e.as_contract(&factory_id, || {
         assert!(get_vault_info(&e, &vault).is_some());
-        assert!(get_all_vaults(&e).contains(vault.clone()));
-        assert!(get_single_rwa_vaults(&e).contains(vault.clone()));
+        assert!(all_pre.contains(vault.clone()));
+        assert!(single_pre.contains(vault.clone()));
     });
 
     client.remove_vault(&admin, &vault);
 
     // Post-conditions: vault purged from all lists and VaultInfo deleted
+    let all_post = client.get_all_vaults();
+    let single_post = client.get_single_rwa_vaults();
     e.as_contract(&factory_id, || {
         assert!(
             get_vault_info(&e, &vault).is_none(),
             "VaultInfo must be deleted"
         );
         assert!(
-            !get_all_vaults(&e).contains(vault.clone()),
+            !all_post.contains(vault.clone()),
             "vault must not appear in AllVaults"
         );
         assert!(
-            !get_single_rwa_vaults(&e).contains(vault.clone()),
+            !single_post.contains(vault.clone()),
             "vault must not appear in SingleRwaVaults"
         );
     });
@@ -358,8 +546,8 @@ fn test_get_all_vaults_excludes_removed_vault() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     // Two vaults; one will be removed
     let keep = inject_vault(&e, &factory_id, false);
@@ -385,8 +573,8 @@ fn test_remove_vault_non_admin_fails() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
     let vault = inject_vault(&e, &factory_id, false);
 
     let random = Address::generate(&e);
@@ -400,8 +588,8 @@ fn test_remove_active_vault_fails() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
     let vault = inject_vault(&e, &factory_id, true /* active */);
 
     client.remove_vault(&admin, &vault);
@@ -414,7 +602,8 @@ fn test_remove_unknown_vault_fails() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
     let ghost = Address::generate(&e);
 
     client.remove_vault(&admin, &ghost);
@@ -426,8 +615,8 @@ fn test_remove_vault_emits_event() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
     let vault = inject_vault(&e, &factory_id, false);
 
     client.remove_vault(&admin, &vault);
@@ -457,7 +646,8 @@ fn test_batch_create_vaults_exceeds_limit() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
     let asset = Address::generate(&e);
 
     // Build a batch of 11 entries (one over the limit).
@@ -492,7 +682,8 @@ fn test_batch_create_vaults_at_limit_ok() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
     let asset = Address::generate(&e);
 
     let mut params: soroban_sdk::Vec<crate::types::BatchVaultParams> = soroban_sdk::Vec::new(&e);
@@ -557,8 +748,9 @@ fn test_view_functions_non_existent_vault() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+    let _factory_id = factory_id;
 
     // Generate a vault address that is not registered
     let non_existent_vault = Address::generate(&e);
@@ -583,12 +775,12 @@ fn test_view_functions_non_existent_vault() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.set_vault_status(&admin, &non_existent_vault, &false);
     }));
-    
+
     assert!(
         result.is_err(),
         "set_vault_status should panic for non-existent vault"
     );
-    
+
     // Verify the panic message contains the expected error code
     if let Err(panic_payload) = result {
         let panic_msg = if let Some(s) = panic_payload.downcast_ref::<std::string::String>() {
@@ -598,7 +790,7 @@ fn test_view_functions_non_existent_vault() {
         } else {
             std::string::String::from("")
         };
-        
+
         // The error code for VaultNotFound is #2 based on the existing tests
         assert!(
             panic_msg.contains("#2") || panic_msg.contains("VaultNotFound"),
@@ -636,15 +828,14 @@ fn test_mixed_vault_types_registry_filtering() {
     let e = Env::default();
     e.mock_all_auths();
 
-    let (client, _admin) = setup_factory(&e);
-    let factory_id = client.address.clone();
+    let (factory_id, _admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
 
     // Inject a SingleRwa vault directly (active).
     let single_rwa_vault = inject_vault(&e, &factory_id, true);
 
     // Inject a stub Aggregator vault entry directly into the registry.
-    // TODO: replace this manual injection with a real factory call once
-    //       `create_aggregator_vault` is implemented.
+    // Replace this with a real factory call once aggregator deployment exists.
     let aggregator_vault = Address::generate(&e);
     let aggregator_info = crate::types::VaultInfo {
         vault: aggregator_vault.clone(),
@@ -657,33 +848,39 @@ fn test_mixed_vault_types_registry_filtering() {
     };
     e.as_contract(&factory_id, || {
         put_vault_info(&e, &aggregator_vault, aggregator_info);
-        push_all_vaults(&e, aggregator_vault.clone());
-        push_active_vaults(&e, aggregator_vault.clone());
-        // Intentionally NOT pushed to SingleRwaVaults list.
+        register_vault(&e, aggregator_vault.clone());
     });
 
     // ── get_all_vaults returns both types ─────────────────────────────────────
     let all = client.get_all_vaults();
     assert_eq!(all.len(), 2, "get_all_vaults must return both vault types");
-    assert!(all.contains(single_rwa_vault.clone()), "all vaults must include SingleRwa vault");
-    assert!(all.contains(aggregator_vault.clone()), "all vaults must include Aggregator vault");
+    assert!(
+        all.contains(single_rwa_vault.clone()),
+        "all vaults must include SingleRwa vault"
+    );
+    assert!(
+        all.contains(aggregator_vault.clone()),
+        "all vaults must include Aggregator vault"
+    );
 
     // ── get_active_vaults returns both active entries ─────────────────────────
     let active = client.get_active_vaults();
-    assert_eq!(active.len(), 2, "get_active_vaults must return all active vaults");
+    assert_eq!(
+        active.len(),
+        2,
+        "get_active_vaults must return all active vaults"
+    );
 
     // ── SingleRwa-specific list must not include the Aggregator vault ─────────
-    e.as_contract(&factory_id, || {
-        let single_rwa_list = get_single_rwa_vaults(&e);
-        assert!(
-            single_rwa_list.contains(single_rwa_vault.clone()),
-            "SingleRwaVaults list must contain the SingleRwa vault"
-        );
-        assert!(
-            !single_rwa_list.contains(aggregator_vault.clone()),
-            "SingleRwaVaults list must NOT contain the Aggregator vault"
-        );
-    });
+    let single_rwa_list = client.get_single_rwa_vaults();
+    assert!(
+        single_rwa_list.contains(single_rwa_vault.clone()),
+        "SingleRwaVaults list must contain the SingleRwa vault"
+    );
+    assert!(
+        !single_rwa_list.contains(aggregator_vault.clone()),
+        "SingleRwaVaults list must NOT contain the Aggregator vault"
+    );
 
     // ── VaultInfo.vault_type discriminates correctly ───────────────────────────
     let single_info = client
@@ -695,4 +892,284 @@ fn test_mixed_vault_types_registry_filtering() {
         .get_vault_info(&aggregator_vault)
         .expect("Aggregator VaultInfo must exist");
     assert_eq!(agg_info.vault_type, crate::types::VaultType::Aggregator);
+}
+
+// ─── Vault Ordering ───────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #157 — Pagination over exact multiples of page size
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When the total vault count is exactly 2× the page size (20 vaults, page 10),
+/// the first page must be full and the second page must be exactly the remainder
+/// — no duplicates, no omissions.
+#[test]
+fn test_get_vaults_paginated_exact_double_page_size() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let page_size: u32 = 10;
+    let total: u32 = page_size * 2; // exactly 20
+
+    let mut all_vaults = soroban_sdk::Vec::new(&e);
+    for _ in 0..total {
+        all_vaults.push_back(inject_vault(&e, &factory_id, true));
+    }
+
+    let page1 = client.get_vaults_paginated(&0, &page_size);
+    assert_eq!(
+        page1.len(),
+        page_size,
+        "first page must be exactly page_size items"
+    );
+
+    let page2 = client.get_vaults_paginated(&page_size, &page_size);
+    assert_eq!(
+        page2.len(),
+        page_size,
+        "second page must be exactly page_size items (no omissions)"
+    );
+
+    // No duplicates: union of both pages must equal the full vault list.
+    for i in 0..page_size {
+        assert_eq!(
+            page1.get(i).unwrap(),
+            all_vaults.get(i).unwrap(),
+            "page1[{i}] mismatch"
+        );
+        assert_eq!(
+            page2.get(i).unwrap(),
+            all_vaults.get(page_size + i).unwrap(),
+            "page2[{i}] mismatch"
+        );
+    }
+}
+
+/// When the total vault count is exactly 3× the page size (30 vaults, page 10),
+/// all three pages must each return exactly page_size items with no gaps.
+#[test]
+fn test_get_vaults_paginated_exact_triple_page_size() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let page_size: u32 = 10;
+    let total: u32 = page_size * 3; // exactly 30
+
+    let mut all_vaults = soroban_sdk::Vec::new(&e);
+    for _ in 0..total {
+        all_vaults.push_back(inject_vault(&e, &factory_id, true));
+    }
+
+    for page_idx in 0u32..3 {
+        let offset = page_idx * page_size;
+        let page = client.get_vaults_paginated(&offset, &page_size);
+        assert_eq!(
+            page.len(),
+            page_size,
+            "page {page_idx} must return exactly {page_size} items"
+        );
+        for i in 0..page_size {
+            assert_eq!(
+                page.get(i).unwrap(),
+                all_vaults.get(offset + i).unwrap(),
+                "page {page_idx} item {i} mismatch"
+            );
+        }
+    }
+
+    // Page after the last item returns empty.
+    let beyond = client.get_vaults_paginated(&total, &page_size);
+    assert_eq!(beyond.len(), 0, "page beyond the last item must be empty");
+}
+
+/// Exact-multiple test for active-only pagination: 20 active vaults, page 10.
+#[test]
+fn test_get_active_vaults_paginated_exact_double_page_size() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, _) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let page_size: u32 = 10;
+    let total: u32 = page_size * 2;
+
+    let mut active_vaults = soroban_sdk::Vec::new(&e);
+    for _ in 0..total {
+        active_vaults.push_back(inject_vault(&e, &factory_id, true));
+    }
+
+    let page1 = client.get_active_vaults_paginated(&0, &page_size);
+    assert_eq!(page1.len(), page_size, "first active page must be full");
+
+    let page2 = client.get_active_vaults_paginated(&page_size, &page_size);
+    assert_eq!(
+        page2.len(),
+        page_size,
+        "second active page must be full (no omissions)"
+    );
+
+    for i in 0..page_size {
+        assert_eq!(page1.get(i).unwrap(), active_vaults.get(i).unwrap());
+        assert_eq!(
+            page2.get(i).unwrap(),
+            active_vaults.get(page_size + i).unwrap()
+        );
+    }
+
+    // No additional items beyond page 2.
+    let empty = client.get_active_vaults_paginated(&total, &page_size);
+    assert_eq!(empty.len(), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #156 — Default vault params sanity check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calling set_defaults stores asset, zkme_verifier, and cooperator, which are
+/// immediately readable via the corresponding view functions.  This is the
+/// canonical path for verifying that factory defaults are wired through
+/// correctly before creating vaults with them.
+#[test]
+fn test_default_vault_params_stored_and_readable() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let new_asset = Address::generate(&e);
+    let new_zkme = Address::generate(&e);
+    let new_coop = Address::generate(&e);
+
+    client.set_defaults(&admin, &new_asset, &new_zkme, &new_coop);
+
+    assert_eq!(
+        client.default_asset(),
+        new_asset,
+        "default_asset must reflect the value passed to set_defaults"
+    );
+    assert_eq!(
+        client.default_zkme_verifier(),
+        new_zkme,
+        "default_zkme_verifier must reflect the value passed to set_defaults"
+    );
+    assert_eq!(
+        client.default_cooperator(),
+        new_coop,
+        "default_cooperator must reflect the value passed to set_defaults"
+    );
+}
+
+/// Overwriting defaults with a second set_defaults call replaces the previous
+/// values — there is no stale carry-over from the first call.
+#[test]
+fn test_default_vault_params_overwrite_previous() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let asset_v1 = Address::generate(&e);
+    let zkme_v1 = Address::generate(&e);
+    let coop_v1 = Address::generate(&e);
+    client.set_defaults(&admin, &asset_v1, &zkme_v1, &coop_v1);
+
+    let asset_v2 = Address::generate(&e);
+    let zkme_v2 = Address::generate(&e);
+    let coop_v2 = Address::generate(&e);
+    client.set_defaults(&admin, &asset_v2, &zkme_v2, &coop_v2);
+
+    assert_eq!(client.default_asset(), asset_v2);
+    assert_eq!(client.default_zkme_verifier(), zkme_v2);
+    assert_eq!(client.default_cooperator(), coop_v2);
+}
+
+/// Non-admin callers must not be able to update defaults.
+#[test]
+#[should_panic]
+fn test_set_defaults_non_admin_rejected() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, _admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+    let attacker = Address::generate(&e);
+
+    // Disable the blanket mock so auth is actually enforced.
+    // Re-register without mock_all_auths isn't straightforward in the test
+    // harness, so we rely on the contract's require_admin check panicking
+    // when called by a non-admin address.
+    client.set_defaults(
+        &attacker,
+        &Address::generate(&e),
+        &Address::generate(&e),
+        &Address::generate(&e),
+    );
+}
+
+/// get_all_vaults returns vaults in the order they were created.
+#[test]
+fn test_get_all_vaults_returns_vaults_in_creation_order() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (factory_id, _admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    // Inject vaults in a known order
+    let v1 = inject_vault(&e, &factory_id, true);
+    let v2 = inject_vault(&e, &factory_id, true);
+    let v3 = inject_vault(&e, &factory_id, true);
+    let v4 = inject_vault(&e, &factory_id, true);
+
+    // Get all vaults
+    let all_vaults = client.get_all_vaults();
+
+    // Verify count
+    assert_eq!(all_vaults.len(), 4);
+
+    // Verify order matches creation order
+    assert_eq!(all_vaults.get(0).unwrap(), v1);
+    assert_eq!(all_vaults.get(1).unwrap(), v2);
+    assert_eq!(all_vaults.get(2).unwrap(), v3);
+    assert_eq!(all_vaults.get(3).unwrap(), v4);
+
+    // Verify vault count matches
+    assert_eq!(client.get_vault_count(), 4);
+}
+
+#[test]
+fn test_list_recent_vaults_returns_newest_first() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (factory_id, _admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let v1 = inject_vault_with_deploy_id(&e, &factory_id, true);
+    let v2 = inject_vault_with_deploy_id(&e, &factory_id, true);
+    let v3 = inject_vault_with_deploy_id(&e, &factory_id, true);
+    let v4 = inject_vault_with_deploy_id(&e, &factory_id, true);
+    let v5 = inject_vault_with_deploy_id(&e, &factory_id, true);
+
+    let recent = client.list_recent_vaults(&3);
+    assert_eq!(recent.len(), 3);
+    assert_eq!(recent.get(0).unwrap(), v5);
+    assert_eq!(recent.get(1).unwrap(), v4);
+    assert_eq!(recent.get(2).unwrap(), v3);
+
+    // Asking for more than exist returns all (up to cap).
+    let all_recent = client.list_recent_vaults(&10);
+    assert_eq!(all_recent.len(), 5);
+    assert_eq!(all_recent.get(4).unwrap(), v1);
+    assert_eq!(all_recent.get(0).unwrap(), v5);
+    assert_eq!(all_recent.get(1).unwrap(), v4);
+    assert_eq!(all_recent.get(2).unwrap(), v3);
+    assert_eq!(all_recent.get(3).unwrap(), v2);
 }

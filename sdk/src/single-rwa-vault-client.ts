@@ -38,8 +38,14 @@ export class SingleRwaVaultClient {
   zkmeVerifier(): SorobanOperation {
     return this.call("zkme_verifier");
   }
+  getZkmeVerifier(): SorobanOperation {
+    return this.call("get_zkme_verifier");
+  }
   cooperator(): SorobanOperation {
     return this.call("cooperator");
+  }
+  getCooperator(): SorobanOperation {
+    return this.call("get_cooperator");
   }
   setZkmeVerifier(caller: string, verifier: string): SorobanOperation {
     return this.call("set_zkme_verifier", scAddress(caller), scAddress(verifier));
@@ -97,6 +103,9 @@ export class SingleRwaVaultClient {
   }
   redemptionRequest(requestId: number): SorobanOperation {
     return this.call("redemption_request", scU32(requestId));
+  }
+  nextRedemptionRequestId(): SorobanOperation {
+    return this.call("next_redemption_request_id");
   }
   maxDeposit(receiver: string): SorobanOperation {
     return this.call("max_deposit", scAddress(receiver));
@@ -182,6 +191,9 @@ export class SingleRwaVaultClient {
   }
   minDeposit(): SorobanOperation {
     return this.call("min_deposit");
+  }
+  getMinDeposit(): SorobanOperation {
+    return this.call("get_min_deposit");
   }
   maxDepositPerUser(): SorobanOperation {
     return this.call("max_deposit_per_user");
