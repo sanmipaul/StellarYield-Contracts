@@ -84,6 +84,34 @@ export class YieldService {
     };
   }
 
+  async getYieldSummary(contractId: string): Promise<{
+    totalEpochs: string;
+    totalYieldDistributed: string;
+    averageYieldPerEpoch: string;
+  }> {
+    const rows = await query<{
+      total_epochs: string;
+      total_yield: string;
+    }>(
+      `SELECT COUNT(e.id)::text AS total_epochs,
+              COALESCE(SUM(e.yield_amount::numeric), 0)::text AS total_yield
+       FROM epochs e
+       JOIN vaults v ON e.vault_id = v.id
+       WHERE v.contract_id = $1`,
+      [contractId],
+    );
+
+    const totalEpochs = BigInt(rows[0]?.total_epochs ?? "0");
+    const totalYield = BigInt(rows[0]?.total_yield ?? "0");
+    const average = totalEpochs > BigInt(0) ? totalYield / totalEpochs : BigInt(0);
+
+    return {
+      totalEpochs: totalEpochs.toString(),
+      totalYieldDistributed: totalYield.toString(),
+      averageYieldPerEpoch: average.toString(),
+    };
+  }
+
   async recordEpoch(
     _vaultId: number,
     _epoch: number,
