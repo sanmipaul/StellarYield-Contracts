@@ -6,7 +6,12 @@ const yieldService = new YieldService();
 export async function getVaultEpochs(req: Request, res: Response, next: NextFunction) {
   try {
     const epochs = await yieldService.getVaultEpochs(String(req.params["contractId"]));
-    res.json(epochs);
+    res.json(
+      epochs.map((e) => ({
+        ...e,
+        distributedAt: e.distributedAt ? e.distributedAt.toISOString() : null,
+      })),
+    );
   } catch (err) {
     next(err);
   }
