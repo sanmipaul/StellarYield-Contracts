@@ -45,6 +45,9 @@ const envSchema = z.object({
   LOG_LEVEL: z
     .string()
     .default("info"),
+  ALLOWED_ORIGINS: z
+    .string()
+    .default(""),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -77,6 +80,13 @@ export const config = {
     startLedger: parsed.data.INDEXER_START_LEDGER,
     pollIntervalMs: parsed.data.INDEXER_POLL_INTERVAL_MS,
   },
+
+  allowedOrigins: (() => {
+    const raw = parsed.data.ALLOWED_ORIGINS;
+    if (raw) return raw.split(",").map((s) => s.trim()).filter(Boolean);
+    if (parsed.data.NODE_ENV === "development") return ["*"];
+    return [];
+  })(),
 
   webhookSecret: parsed.data.WEBHOOK_SECRET,
   logLevel: parsed.data.LOG_LEVEL,
