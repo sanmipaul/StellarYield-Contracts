@@ -9,7 +9,7 @@ async function getTestContext() {
   const { NotificationService } = await import("./notifications.js");
   return {
     query: query as ReturnType<typeof vi.fn>,
-    logger: logger as { warn: ReturnType<typeof vi.fn> },
+    logger: logger as unknown as { warn: ReturnType<typeof vi.fn> },
     service: new NotificationService(),
   };
 }
