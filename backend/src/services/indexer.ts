@@ -196,9 +196,45 @@ export class Indexer {
   }
 
   protected async _handleWithdraw(
-    _contractId: string,
-    _ev: rpc.Api.EventResponse,
-  ): Promise<void> {}
+    contractId: string,
+    ev: rpc.Api.EventResponse,
+  ): Promise<void> {
+    // topic: [Symbol("withdraw"), caller, receiver, owner]
+    // value: [assets, shares]
+    const owner = decodeAddr(ev.topic[3] ?? ev.topic[1]);
+    const data = decodeValue(ev);
+    const dataArr = Array.isArray(data) ? data : Object.values(data as Record<string, unknown>);
+    const assets = decodeBigInt(dataArr[0]);
+    const shares = decodeBigInt(dataArr[1]);
+
+    const payload = { owner, assets: assets.toString(), shares: shares.toString() };
+    await storeIndexedEvent(contractId, "withdraw", ev, payload).catch((err) =>
+      logger.warn(err, "Failed to store withdraw event"),
+    );
+
+    const vaultRow = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRow.length === 0) {
+      logger.warn({ contractId }, "Withdraw event for unknown vault — skipping position update");
+      return;
+    }
+    const vaultId = vaultRow[0].id;
+
+    // Decrement shares and deposited; clamp both to zero (never negative)
+    await query(
+      `INSERT INTO user_vault_positions (user_address, vault_id, shares, deposited)
+       VALUES ($1, $2, 0, 0)
+       ON CONFLICT (user_address, vault_id) DO UPDATE SET
+         shares    = GREATEST(0, user_vault_positions.shares    - $3),
+         deposited = GREATEST(0, user_vault_positions.deposited - $4),
+         updated_at = NOW()`,
+      [owner, vaultId, shares.toString(), assets.toString()],
+    );
+
+    logger.info({ contractId, owner, shares: shares.toString() }, "Processed withdraw event");
+  }
 
   protected async _handleYieldDistributed(
     _contractId: string,
