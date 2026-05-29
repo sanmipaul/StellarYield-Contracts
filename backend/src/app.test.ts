@@ -4,6 +4,7 @@ vi.mock("./db/index.js", () => ({
   query: vi.fn().mockResolvedValue([]),
   pool: { query: vi.fn().mockResolvedValue({ rows: [] }) },
 }));
+vi.mock("pino-http", () => ({ pinoHttp: () => (_req: any, _res: any, next: any) => next() }));
 
 import { createApp } from "./app.js";
 

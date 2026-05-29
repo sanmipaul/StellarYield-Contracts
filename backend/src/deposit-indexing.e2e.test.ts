@@ -20,6 +20,7 @@ vi.mock("./services/vault.js", () => ({
 vi.mock("./services/notifications.js", () => ({
   NotificationService: vi.fn().mockImplementation(() => ({})),
 }));
+vi.mock("pino-http", () => ({ pinoHttp: () => (_req: any, _res: any, next: any) => next() }));
 
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { Indexer } from "./services/indexer.js";
