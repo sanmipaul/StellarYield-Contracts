@@ -6,14 +6,18 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     VaultAlreadyExists = 1,
-    VaultNotFound      = 2,
-    NotAuthorized      = 3,
+    VaultNotFound = 2,
+    NotAuthorized = 3,
     /// Vault must be set inactive before it can be removed.
-    VaultIsActive      = 4,
+    VaultIsActive = 4,
     /// Requested operation is not supported.
-    NotSupported       = 5,
+    NotSupported = 5,
     /// Invalid initialization parameters provided.
-    InvalidInitParams  = 6,
+    InvalidInitParams = 6,
     /// Batch size exceeds the maximum allowed limit.
-    BatchTooLarge      = 7,
+    BatchTooLarge = 7,
+    /// Provided WASM hash is invalid (e.g. all-zeros).
+    InvalidWasmHash = 8,
+    /// Storage schema version is outdated; migrate() must be called.
+    MigrationRequired = 9,
 }
