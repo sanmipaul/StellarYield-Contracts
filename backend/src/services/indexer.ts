@@ -326,6 +326,18 @@ export class Indexer {
       return;
     }
 
+    const cancelFunding = parseCancelFundingEvent(event);
+    if (cancelFunding) {
+      await this.handleCancelFunding(event.contractId ?? "");
+      await this.recordEvent(event, "cancel_funding");
+      try {
+        await this.notificationService?.notify("cancel_funding", cancelFunding as any);
+      } catch (e) {
+        logger.warn({ err: e }, "NotificationService.notify failed for cancel_funding");
+      }
+      return;
+    }
+
     const vaultStateChanged = parseVaultStateChangedEvent(event);
     if (vaultStateChanged) {
       await this.recordEvent(event, "vault_state_changed");
