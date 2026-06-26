@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import {
+  getPortfoliosBatch,
   getUser,
   getUserKyc,
   getUserPortfolio,
@@ -8,6 +9,7 @@ import {
   searchUsers,
 } from "../controllers/users.js";
 import {
+  validateBody,
   validateParams,
   validateQuery,
   stellarAddressSchema,
@@ -17,6 +19,13 @@ export const usersRouter = Router();
 
 const addressParamSchema = z.object({
   address: stellarAddressSchema,
+});
+
+const batchPortfoliosBodySchema = z.object({
+  addresses: z
+    .array(stellarAddressSchema)
+    .min(1, "At least one address is required")
+    .max(50, "A maximum of 50 addresses is allowed"),
 });
 
 const searchQuerySchema = z.object({
@@ -33,6 +42,11 @@ const yieldHistoryQuerySchema = z.object({
 });
 
 usersRouter.get("/", validateQuery(searchQuerySchema), searchUsers);
+usersRouter.post(
+  "/portfolios/batch",
+  validateBody(batchPortfoliosBodySchema),
+  getPortfoliosBatch,
+);
 usersRouter.get(
   "/:address/kyc",
   validateParams(addressParamSchema),
